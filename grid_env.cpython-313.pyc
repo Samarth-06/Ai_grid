@@ -1,0 +1,417 @@
+"""
+GridMind — backend/models/grid_env.py
+Custom Gymnasium environment wrapping a Pandapower 6-node grid.
+
+Observation space : Box(12,) — all values in [0, 1]
+Action space      : Box(3,)  — [route_industrial, route_residential, battery_cmd]
+Reward            : R = w1*stability - w2*(1-carbon_reduction) - w3*brownout
+"""
+
+import os
+import sys
+import math
+import numpy as np
+import gymnasium as gym
+from gymnasium import spaces
+
+# ---------------------------------------------------------------------------
+# Optional Pandapower import — fall back to physics approximation if missing
+# ---------------------------------------------------------------------------
+try:
+    import pandapower as pp
+    _PP_AVAILABLE = True
+except ImportError:
+    _PP_AVAILABLE = False
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+MAX_INDUSTRIAL_MW   = 1500.0
+MAX_RESIDENTIAL_MW  = 1500.0
+MAX_SOLAR_MW        = 200.0
+MAX_WIND_MW         = 200.0
+MAX_FORECAST_MEAN   = 3000.0
+MAX_FORECAST_STD    = 1000.0
+
+BATTERY_CAPACITY_MWH = 500.0
+BATTERY_MAX_POWER_MW = 100.0     # ±100 MW
+BATTERY_SOC_MIN      = 0.10
+BATTERY_SOC_MAX      = 0.95
+BATTERY_EFFICIENCY   = 0.92      # round-trip efficiency factor per step
+
+BROWNOUT_THRESHOLD   = 0.80      # line loading fraction above which a brownout starts
+EPISODE_LENGTH       = 24 * 7    # 1 week of hourly steps
+
+# Reward weights
+W_STABILITY     = 1.0
+W_CARBON        = 0.5
+W_BROWNOUT      = 2.0
+
+# Scenario parameter presets
+SCENARIO_PRESETS = {
+    "normal": {
+        "industrial_multiplier": 1.0,
+        "residential_multiplier": 1.0,
+        "solar_multiplier": 1.0,
+        "wind_multiplier": 1.0,
+        "wind_offline": False,
+    },
+    "industrial_spike": {
+        "industrial_multiplier": 1.42,   # +42%
+        "residential_multiplier": 1.0,
+        "solar_multiplier": 1.0,
+        "wind_multiplier": 1.0,
+        "wind_offline": False,
+    },
+    "storm": {
+        "industrial_multiplier": 1.0,
+        "residential_multiplier": 1.15,  # +15% heating
+        "solar_multiplier": 0.21,        # 140 → 30 MW
+        "wind_multiplier": 0.22,         # 90  → 20 MW
+        "wind_offline": False,
+    },
+    "battery_depletion": {
+        "industrial_multiplier": 1.0,
+        "residential_multiplier": 1.0,
+        "solar_multiplier": 1.0,
+        "wind_multiplier": 1.0,
+        "wind_offline": False,
+        "force_battery_soc": 0.12,
+    },
+    "dual_failure": {
+        "industrial_multiplier": 1.42,   # spike
+        "residential_multiplier": 1.0,
+        "solar_multiplier": 1.0,
+        "wind_multiplier": 0.0,
+        "wind_offline": True,
+    },
+}
+
+
+# ===========================================================================
+class GridEnv(gym.Env):
+    """
+    6-node Pandapower micro-grid Gymnasium environment.
+
+    Nodes
+    -----
+    0 — Substation  (slack, 110 kV external grid)
+    1 — Industrial  (load bus, 600 MW base)
+    2 — Residential (load bus, 800 MW base)
+    3 — Solar       (generator, 200 MW peak)
+    4 — Wind        (generator, 150 MW peak)
+    5 — Battery     (storage,  500 MWh / ±100 MW)
+    """
+
+    metadata = {"render_modes": []}
+
+    def __init__(self, load_profile: np.ndarray = None, forecast_fn=None):
+        """
+        Parameters
+        ----------
+        load_profile : np.ndarray of shape (T, 5)
+            Columns: industrial_mw, residential_mw, solar_mw, wind_mw,
+                     carbon_intensity
+            If None a small synthetic profile is generated.
+        forecast_fn : callable | None
+            Callable(current_idx, horizon=12) → (mean_mw, std_mw).
+            If None a simple rolling estimate is used.
+        """
+        super().__init__()
+
+        self.load_profile = load_profile if load_profile is not None \
+            else self._synthetic_profile(EPISODE_LENGTH + 48)
+        self.forecast_fn  = forecast_fn
+
+        # Gymnasium spaces
+        self.observation_space = spaces.Box(
+            low=0.0, high=1.0, shape=(12,), dtype=np.float32
+        )
+        self.action_space = spaces.Box(
+            low=np.array([0.0,  0.0, -1.0], dtype=np.float32),
+            high=np.array([1.0,  1.0,  1.0], dtype=np.float32),
+            dtype=np.float32,
+        )
+
+        # Runtime state (populated in reset())
+        self._step_idx        = 0
+        self._profile_idx     = 0
+        self._battery_soc     = 0.5
+        self._scenario_params = dict(SCENARIO_PRESETS["normal"])
+        self._net             = None          # pandapower network
+        self._episode_carbon_saved = 0.0
+
+        # Build the static pandapower network once
+        if _PP_AVAILABLE:
+            self._net = self._build_pandapower_net()
+
+    # ------------------------------------------------------------------
+    # Gymnasium API
+    # ------------------------------------------------------------------
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self._step_idx    = 0
+        self._profile_idx = np.random.randint(0, max(1, len(self.load_profile) - EPISODE_LENGTH - 48))
+        self._battery_soc = np.clip(
+            self._scenario_params.get("force_battery_soc", np.random.uniform(0.3, 0.7)),
+            BATTERY_SOC_MIN, BATTERY_SOC_MAX
+        )
+        self._episode_carbon_saved = 0.0
+        obs = self._get_obs()
+        return obs, {}
+
+    def step(self, action: np.ndarray):
+        action = np.clip(action, self.action_space.low, self.action_space.high)
+        route_ind  = float(action[0])
+        route_res  = float(action[1])
+        battery_cmd = float(action[2])   # -1=discharge, +1=charge
+
+        # Load from profile
+        row = self._current_row()
+        industrial_mw  = row[0] * self._scenario_params.get("industrial_multiplier", 1.0)
+        residential_mw = row[1] * self._scenario_params.get("residential_multiplier", 1.0)
+        solar_mw       = row[2] * self._scenario_params.get("solar_multiplier", 1.0)
+        wind_mw        = row[3] * self._scenario_params.get("wind_multiplier", 1.0)
+        carbon_intensity = row[4]
+
+        if self._scenario_params.get("wind_offline", False):
+            wind_mw = 0.0
+
+        # Battery dynamics
+        battery_power_mw = battery_cmd * BATTERY_MAX_POWER_MW
+        delta_soc = (-battery_power_mw / BATTERY_CAPACITY_MWH) * BATTERY_EFFICIENCY
+        self._battery_soc = np.clip(self._battery_soc + delta_soc, BATTERY_SOC_MIN, BATTERY_SOC_MAX)
+
+        # Actual battery exchange (clamped by SOC headroom)
+        actual_battery_mw = battery_power_mw  # positive = charging = net load
+
+        # Run power-flow
+        line_loading, voltage_deviation = self._run_power_flow(
+            industrial_mw, residential_mw, solar_mw, wind_mw, actual_battery_mw,
+            route_ind, route_res
+        )
+
+        # Reward components
+        stability      = 1.0 - np.clip(line_loading / 1.0, 0.0, 1.0)
+        renewable_frac = (solar_mw + wind_mw) / max(industrial_mw + residential_mw, 1.0)
+        carbon_reduction = np.clip(renewable_frac, 0.0, 1.0)
+        brownout       = 1.0 if line_loading > BROWNOUT_THRESHOLD else 0.0
+
+        reward = (
+            W_STABILITY * stability
+            - W_CARBON   * (1.0 - carbon_reduction)
+            - W_BROWNOUT * brownout
+        )
+
+        baseline_carbon = carbon_intensity * (industrial_mw + residential_mw) / 1000.0
+        actual_carbon   = carbon_intensity * max(
+            (industrial_mw + residential_mw) - solar_mw - wind_mw, 0.0
+        ) / 1000.0
+        self._episode_carbon_saved += max(baseline_carbon - actual_carbon, 0.0)
+
+        self._step_idx    += 1
+        self._profile_idx += 1
+        terminated = self._step_idx >= EPISODE_LENGTH
+        truncated  = False
+
+        obs  = self._get_obs()
+        info = {
+            "line_loading":     float(line_loading),
+            "battery_soc":      float(self._battery_soc),
+            "carbon_intensity": float(carbon_intensity),
+            "carbon_saved_kg":  float(self._episode_carbon_saved),
+            "brownout":         bool(brownout),
+            "renewable_frac":   float(renewable_frac),
+            "route_industrial": float(route_ind),
+            "route_residential":float(route_res),
+            "battery_cmd":      float(battery_cmd),
+        }
+        return obs, float(reward), terminated, truncated, info
+
+    def inject_scenario(self, scenario_id: str):
+        """
+        Hot-inject a scenario mid-episode without resetting.
+        scenario_id: 'normal' | 'industrial_spike' | 'storm' |
+                     'battery_depletion' | 'dual_failure'
+        """
+        if scenario_id not in SCENARIO_PRESETS:
+            raise ValueError(f"Unknown scenario_id '{scenario_id}'. "
+                             f"Valid: {list(SCENARIO_PRESETS.keys())}")
+        self._scenario_params = dict(SCENARIO_PRESETS[scenario_id])
+        if "force_battery_soc" in self._scenario_params:
+            self._battery_soc = float(self._scenario_params["force_battery_soc"])
+
+    def get_grid_state(self) -> dict:
+        """Return a JSON-serialisable snapshot of the current grid state."""
+        row = self._current_row()
+        sp  = self._scenario_params
+        return {
+            "nodes": [
+                {"id": 0, "name": "Substation",  "type": "slack",     "voltage_pu": 1.00, "load_mw": 0.0,                              "gen_mw":  float(row[0]+row[1]),      "soc": None,  "alert": False},
+                {"id": 1, "name": "Industrial",  "type": "load",      "voltage_pu": 0.98, "load_mw": float(row[0]*sp.get("industrial_multiplier",1.0)), "gen_mw": 0.0, "soc": None, "alert": row[0]*sp.get("industrial_multiplier",1.0) > 800},
+                {"id": 2, "name": "Residential", "type": "load",      "voltage_pu": 0.97, "load_mw": float(row[1]*sp.get("residential_multiplier",1.0)), "gen_mw": 0.0, "soc": None, "alert": False},
+                {"id": 3, "name": "Solar",       "type": "generator", "voltage_pu": 1.00, "load_mw": 0.0, "gen_mw": float(row[2]*sp.get("solar_multiplier",1.0)),  "soc": None, "alert": False},
+                {"id": 4, "name": "Wind",        "type": "generator", "voltage_pu": 1.00, "load_mw": 0.0, "gen_mw": 0.0 if sp.get("wind_offline") else float(row[3]*sp.get("wind_multiplier",1.0)), "soc": None, "alert": sp.get("wind_offline", False)},
+                {"id": 5, "name": "Battery",     "type": "storage",   "voltage_pu": 1.00, "load_mw": 0.0, "gen_mw": 0.0, "soc": float(self._battery_soc), "alert": self._battery_soc < 0.15},
+            ],
+            "lines": [
+                {"from": 0, "to": 1, "loading_percent": 55.0, "status": "ok"},
+                {"from": 0, "to": 2, "loading_percent": 48.0, "status": "ok"},
+                {"from": 3, "to": 0, "loading_percent": 32.0, "status": "ok"},
+                {"from": 4, "to": 0, "loading_percent": 28.0, "status": "ok"},
+                {"from": 5, "to": 0, "loading_percent": 41.0, "status": "ok"},
+            ],
+        }
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _get_obs(self) -> np.ndarray:
+        row  = self._current_row()
+        sp   = self._scenario_params
+        hour = (self._profile_idx) % 24
+        dow  = (self._profile_idx // 24) % 7
+
+        industrial_mw  = row[0] * sp.get("industrial_multiplier", 1.0)
+        residential_mw = row[1] * sp.get("residential_multiplier", 1.0)
+        solar_mw       = row[2] * sp.get("solar_multiplier", 1.0)
+        wind_mw        = 0.0 if sp.get("wind_offline") else row[3] * sp.get("wind_multiplier", 1.0)
+        carbon_int     = row[4]
+
+        fmean, fstd = self._forecast_12h()
+
+        obs = np.array([
+            industrial_mw  / MAX_INDUSTRIAL_MW,
+            residential_mw / MAX_RESIDENTIAL_MW,
+            solar_mw       / MAX_SOLAR_MW,
+            wind_mw        / MAX_WIND_MW,
+            self._battery_soc,
+            (math.sin(2 * math.pi * hour / 24) + 1.0) / 2.0,
+            (math.cos(2 * math.pi * hour / 24) + 1.0) / 2.0,
+            (math.sin(2 * math.pi * dow  / 7)  + 1.0) / 2.0,
+            (math.cos(2 * math.pi * dow  / 7)  + 1.0) / 2.0,
+            fmean  / MAX_FORECAST_MEAN,
+            fstd   / MAX_FORECAST_STD,
+            np.clip(carbon_int, 0.0, 1.0),
+        ], dtype=np.float32)
+        return np.clip(obs, 0.0, 1.0)
+
+    def _current_row(self) -> np.ndarray:
+        idx = min(self._profile_idx, len(self.load_profile) - 1)
+        return self.load_profile[idx]
+
+    def _forecast_12h(self):
+        """Return (mean_mw, std_mw) for the next 12 hours."""
+        if self.forecast_fn is not None:
+            return self.forecast_fn(self._profile_idx, horizon=12)
+        end = min(self._profile_idx + 12, len(self.load_profile))
+        window = self.load_profile[self._profile_idx:end, 0]  # industrial col
+        if len(window) == 0:
+            return 1500.0, 50.0
+        return float(np.mean(window)), float(np.std(window) + 1e-3)
+
+    def _run_power_flow(self, industrial_mw, residential_mw, solar_mw,
+                        wind_mw, battery_mw, route_ind, route_res) -> tuple:
+        """
+        Returns (max_line_loading_fraction, max_voltage_deviation).
+        Uses Pandapower if available, otherwise physics approximation.
+        """
+        if _PP_AVAILABLE and self._net is not None:
+            return self._pandapower_flow(
+                industrial_mw, residential_mw, solar_mw,
+                wind_mw, battery_mw, route_ind, route_res
+            )
+        return self._approx_flow(industrial_mw, residential_mw, solar_mw, wind_mw, battery_mw)
+
+    def _pandapower_flow(self, industrial_mw, residential_mw, solar_mw,
+                         wind_mw, battery_mw, route_ind, route_res):
+        net = self._net
+        try:
+            # Update loads (routing fraction determines how much goes to which bus)
+            net.load.at[0, "p_mw"] = industrial_mw  * route_ind
+            net.load.at[1, "p_mw"] = residential_mw * route_res
+
+            # Generators
+            net.sgen.at[0, "p_mw"] = solar_mw
+            net.sgen.at[1, "p_mw"] = wind_mw
+
+            # Battery: positive battery_mw means charging (net load), negative = discharging (gen)
+            if battery_mw >= 0:
+                net.load.at[2, "p_mw"]  = battery_mw
+                net.sgen.at[2, "p_mw"]  = 0.0
+            else:
+                net.load.at[2, "p_mw"]  = 0.0
+                net.sgen.at[2, "p_mw"]  = abs(battery_mw)
+
+            pp.runpp(net, algorithm="nr", numba=False)
+            max_loading  = float(net.res_line["loading_percent"].max()) / 100.0
+            max_volt_dev = float((net.res_bus["vm_pu"] - 1.0).abs().max())
+            return max_loading, max_volt_dev
+        except Exception:
+            return self._approx_flow(industrial_mw, residential_mw, solar_mw, wind_mw, battery_mw)
+
+    @staticmethod
+    def _approx_flow(industrial_mw, residential_mw, solar_mw, wind_mw, battery_mw):
+        """Simple physics approximation when Pandapower is unavailable."""
+        total_demand = industrial_mw + residential_mw + max(battery_mw, 0.0)
+        total_supply = solar_mw + wind_mw + max(-battery_mw, 0.0)
+        net_from_grid = max(total_demand - total_supply, 0.0)
+        # Assume main tie-line rated at 1400 MW
+        line_loading = net_from_grid / 1400.0
+        volt_dev     = 0.02 * line_loading
+        return float(np.clip(line_loading, 0.0, 2.0)), float(volt_dev)
+
+    def _build_pandapower_net(self):
+        """Construct the 6-node Pandapower network."""
+        net = pp.create_empty_network()
+
+        # Buses
+        pp.create_bus(net, vn_kv=110, name="Substation")      # bus 0
+        pp.create_bus(net, vn_kv=110, name="Industrial")      # bus 1
+        pp.create_bus(net, vn_kv=110, name="Residential")     # bus 2
+        pp.create_bus(net, vn_kv=110, name="Solar")           # bus 3
+        pp.create_bus(net, vn_kv=110, name="Wind")            # bus 4
+        pp.create_bus(net, vn_kv=110, name="Battery")         # bus 5
+
+        # External grid (slack)
+        pp.create_ext_grid(net, bus=0, vm_pu=1.0)
+
+        # Loads: Industrial(1), Residential(2), Battery-load(5)
+        pp.create_load(net, bus=1, p_mw=600.0, q_mvar=0.0, name="Industrial")
+        pp.create_load(net, bus=2, p_mw=800.0, q_mvar=0.0, name="Residential")
+        pp.create_load(net, bus=5, p_mw=0.0,   q_mvar=0.0, name="Battery_charge")
+
+        # Static generators: Solar(3), Wind(4), Battery-discharge(5)
+        pp.create_sgen(net, bus=3, p_mw=200.0, name="Solar")
+        pp.create_sgen(net, bus=4, p_mw=150.0, name="Wind")
+        pp.create_sgen(net, bus=5, p_mw=0.0,   name="Battery_discharge")
+
+        # Lines (all 110 kV, r=0.1 Ω/km, x=0.4 Ω/km, rated 400 A)
+        std = "149-AL1/24-ST1A 110.0"
+        pp.create_line_from_parameters(net, from_bus=0, to_bus=1, length_km=10, r_ohm_per_km=0.1, x_ohm_per_km=0.4, c_nf_per_km=0, max_i_ka=0.4, name="L_Sub_Ind")
+        pp.create_line_from_parameters(net, from_bus=0, to_bus=2, length_km=8,  r_ohm_per_km=0.1, x_ohm_per_km=0.4, c_nf_per_km=0, max_i_ka=0.4, name="L_Sub_Res")
+        pp.create_line_from_parameters(net, from_bus=3, to_bus=0, length_km=15, r_ohm_per_km=0.1, x_ohm_per_km=0.4, c_nf_per_km=0, max_i_ka=0.4, name="L_Solar_Sub")
+        pp.create_line_from_parameters(net, from_bus=4, to_bus=0, length_km=20, r_ohm_per_km=0.1, x_ohm_per_km=0.4, c_nf_per_km=0, max_i_ka=0.4, name="L_Wind_Sub")
+        pp.create_line_from_parameters(net, from_bus=5, to_bus=0, length_km=5,  r_ohm_per_km=0.1, x_ohm_per_km=0.4, c_nf_per_km=0, max_i_ka=0.4, name="L_Bat_Sub")
+
+        return net
+
+    @staticmethod
+    def _synthetic_profile(n: int) -> np.ndarray:
+        """Generate a minimal synthetic load profile of length n."""
+        rng   = np.random.default_rng(42)
+        hours = np.arange(n)
+        industrial  = 600 + 80  * np.sin(2*np.pi*hours/24) + rng.normal(0, 20, n)
+        residential = 800 + 120 * np.sin(2*np.pi*hours/24 - np.pi/4) + rng.normal(0, 30, n)
+        solar       = np.maximum(0, 200 * np.sin(np.pi * (hours % 24 - 6) / 12) * ((hours%24>=6)&(hours%24<=18)))
+        wind        = 75 + 40  * np.sin(2*np.pi*hours/168) + rng.normal(0, 15, n)
+        carbon      = 0.65 - 0.15 * solar / 200.0 + rng.normal(0, 0.02, n)
+        return np.column_stack([
+            np.clip(industrial, 400, 1200),
+            np.clip(residential, 500, 1400),
+            np.clip(solar, 0, 200),
+            np.clip(wind, 10, 150),
+            np.clip(carbon, 0.20, 0.85),
+        ]).astype(np.float32)

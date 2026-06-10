@@ -1,0 +1,134 @@
+# backend/routers/forecast.py
+"""
+GridMind — GET /forecast
+
+Returns a 48-hour demand forecast with uncertainty bands.
+
+DEMO_MODE=true → serves backend/cache/demo_forecasts.json
+DEMO_MODE=false → runs ForecastModel.predict_next_n(48)
+"""
+
+import json
+import logging
+import os
+from datetime import datetime, timezone
+from typing import List
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+
+from backend.config import Settings, get_settings
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/forecast", tags=["forecast"])
+
+
+# ---------------------------------------------------------------------------
+# Response schema
+# ---------------------------------------------------------------------------
+
+class ForecastResponse(BaseModel):
+    predictions: List[float]
+    upper: List[float]
+    lower: List[float]
+    horizon_hours: int
+    timestamps: List[str]
+    demo_mode: bool
+    generated_at: str
+
+
+# ---------------------------------------------------------------------------
+# Endpoint
+# ---------------------------------------------------------------------------
+
+@router.get("", response_model=ForecastResponse)
+async def get_forecast(settings: Settings = Depends(get_settings)):
+    """
+    Return 48-hour demand forecast.
+
+    In DEMO_MODE serves a pre-cached forecast.
+    In live mode runs the LightGBM recursive inference pipeline.
+    """
+    if settings.demo_mode:
+        return _serve_demo_forecast(settings)
+    else:
+        return _serve_live_forecast(settings)
+
+
+# ---------------------------------------------------------------------------
+# DEMO_MODE path
+# ---------------------------------------------------------------------------
+
+def _serve_demo_forecast(settings: Settings) -> ForecastResponse:
+    cache_path = settings.demo_forecasts_path
+
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return ForecastResponse(
+                **data,
+                demo_mode=True,
+                generated_at=datetime.now(timezone.utc).isoformat(),
+            )
+        except Exception as exc:
+            logger.warning("[forecast] Demo cache read failed: %s — using synthetic.", exc)
+
+    # Fallback: generate a synthetic flat forecast so demo never breaks
+    return _synthetic_forecast(demo_mode=True)
+
+
+# ---------------------------------------------------------------------------
+# Live path
+# ---------------------------------------------------------------------------
+
+def _serve_live_forecast(settings: Settings) -> ForecastResponse:
+    try:
+        # Import here to avoid circular import at module load
+        from backend.models.forecast_model import ForecastModel
+
+        fm = ForecastModel(model_path=settings.model_path)
+        fm.load_history(settings.data_csv_path)
+        result = fm.predict_next_n(n_steps=48)
+
+        return ForecastResponse(
+            **result,
+            demo_mode=False,
+            generated_at=datetime.now(timezone.utc).isoformat(),
+        )
+    except FileNotFoundError as exc:
+        logger.error("[forecast] Model not found: %s", exc)
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        logger.exception("[forecast] Live inference failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Forecast inference failed.")
+
+
+# ---------------------------------------------------------------------------
+# Synthetic fallback (always succeeds)
+# ---------------------------------------------------------------------------
+
+def _synthetic_forecast(demo_mode: bool) -> ForecastResponse:
+    """Flat-line synthetic forecast as absolute last resort."""
+    import numpy as np
+    from datetime import timedelta
+
+    now = datetime.now(timezone.utc)
+    base = 1380.0
+    n = 48
+    noise = np.random.default_rng(42).normal(0, 15, n)
+    preds = [round(base + float(noise[i]), 2) for i in range(n)]
+    upper = [round(p * 1.04, 2) for p in preds]
+    lower = [round(p * 0.96, 2) for p in preds]
+    timestamps = [
+        (now + timedelta(hours=i + 1)).isoformat() for i in range(n)
+    ]
+    return ForecastResponse(
+        predictions=preds,
+        upper=upper,
+        lower=lower,
+        horizon_hours=n,
+        timestamps=timestamps,
+        demo_mode=demo_mode,
+        generated_at=now.isoformat(),
+    )

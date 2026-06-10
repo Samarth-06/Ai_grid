@@ -1,0 +1,87 @@
+# ml/evaluate_lgbm.py
+"""
+Holdout evaluation of the trained LightGBM model.
+Prints metrics, residual stats, and feature importances.
+Saves a validation prediction CSV for inspection.
+
+Usage:
+    python ml/evaluate_lgbm.py
+"""
+
+import os
+import pickle
+import sys
+
+import lightgbm as lgb
+import numpy as np
+import pandas as pd
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+
+from ml.features import prepare_train_val_split, FEATURE_COLS, TARGET_COL
+
+DATA_PATH = os.path.join("data", "raw", "kegoc_load.csv")
+MODEL_PATH = os.path.join("data", "processed", "lgbm_model.pkl")
+EVAL_OUT_PATH = os.path.join("data", "processed", "val_predictions.csv")
+
+
+def evaluate():
+    if not os.path.exists(MODEL_PATH):
+        raise FileNotFoundError(
+            f"{MODEL_PATH} not found. Run: python ml/train_lgbm.py"
+        )
+    if not os.path.exists(DATA_PATH):
+        raise FileNotFoundError(
+            f"{DATA_PATH} not found. Run: python data/synthetic/generate_load.py"
+        )
+
+    print("Loading model ...")
+    with open(MODEL_PATH, "rb") as f:
+        model: lgb.LGBMRegressor = pickle.load(f)
+
+    print("Loading and preparing data ...")
+    df = pd.read_csv(DATA_PATH)
+    X_train, X_val, y_train, y_val = prepare_train_val_split(df, val_fraction=0.10)
+    print(f"  Validation rows: {len(X_val):,}")
+
+    print("Running inference on validation set ...")
+    preds = model.predict(X_val)
+
+    mae = mean_absolute_error(y_val, preds)
+    rmse = np.sqrt(mean_squared_error(y_val, preds))
+    mape = np.mean(np.abs((y_val.values - preds) / np.maximum(y_val.values, 1.0))) * 100
+    residuals = y_val.values - preds
+
+    print(f"\n=== Holdout Evaluation ===")
+    print(f"  MAE:             {mae:.2f} MW")
+    print(f"  RMSE:            {rmse:.2f} MW")
+    print(f"  MAPE:            {mape:.2f} %")
+    print(f"  Max overpredict: {(-residuals).max():.2f} MW")
+    print(f"  Max underpredict:{residuals.max():.2f} MW")
+    print(f"  Residual std:    {residuals.std():.2f} MW")
+
+    importances = pd.Series(
+        model.feature_importances_,
+        index=FEATURE_COLS
+    ).sort_values(ascending=False)
+
+    print(f"\n=== Top 15 Feature Importances ===")
+    print(importances.head(15).to_string())
+
+    val_df = X_val.copy()
+    val_df["y_true"] = y_val.values
+    val_df["y_pred"] = preds
+    val_df["residual"] = residuals
+    os.makedirs(os.path.dirname(EVAL_OUT_PATH), exist_ok=True)
+    val_df.to_csv(EVAL_OUT_PATH, index=False)
+    print(f"\nPredictions saved to {EVAL_OUT_PATH}")
+
+    if mape > 10.0:
+        print(f"\nWARNING: MAPE {mape:.2f}% > 10% threshold. Consider retraining.")
+    else:
+        print(f"\nPASS: MAPE {mape:.2f}% is within acceptable range (<10%).")
+
+
+if __name__ == "__main__":
+    evaluate()

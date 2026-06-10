@@ -1,0 +1,150 @@
+# backend/models/forecast_model.py
+"""
+LightGBM inference wrapper for demand forecasting.
+Loads a trained model and produces multi-step forecasts
+with uncertainty bands for the FastAPI backend.
+
+Depends on:
+    - data/processed/lgbm_model.pkl  (from ml/train_lgbm.py)
+    - ml/features.py
+"""
+
+import os
+import pickle
+import sys
+from typing import Dict, List, Optional
+
+import numpy as np
+import pandas as pd
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+
+from ml.features import build_features, FEATURE_COLS, TARGET_COL
+
+DEFAULT_MODEL_PATH = os.path.join("data", "processed", "lgbm_model.pkl")
+
+
+class ForecastModel:
+    """
+    Wraps the trained LightGBM regressor.
+    Provides point forecasts and uncertainty bands.
+    """
+
+    def __init__(self, model_path: str = DEFAULT_MODEL_PATH):
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(
+                f"Model not found at {model_path}. "
+                "Run: python ml/train_lgbm.py"
+            )
+        with open(model_path, "rb") as f:
+            self._model = pickle.load(f)
+        self._history_df: Optional[pd.DataFrame] = None
+
+    @property
+    def model(self):
+        """Underlying LGBMRegressor — used by compute_shap.py."""
+        return self._model
+
+    @property
+    def feature_names(self) -> List[str]:
+        """Feature column names the model was trained on."""
+        return list(FEATURE_COLS)
+
+    def load_history(self, csv_path: str) -> None:
+        """
+        Load raw CSV history so the model can compute lag/rolling features.
+        Call once at startup.
+        """
+        df = pd.read_csv(csv_path)
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        self._history_df = df.sort_values("timestamp").reset_index(drop=True)
+
+    def predict_next_n(
+        self,
+        n_steps: int = 48,
+        history_df: Optional[pd.DataFrame] = None,
+    ) -> Dict:
+        """
+        Recursively predict the next n_steps hours.
+
+        For each step:
+        1. Build features on current history.
+        2. Predict next hour.
+        3. Append synthetic row to history and repeat.
+
+        Uncertainty bands grow linearly with horizon (+/-3% base + 0.2%/step).
+
+        Args:
+            n_steps: Number of hours to forecast.
+            history_df: Optional override; uses self._history_df if None.
+
+        Returns:
+            dict with keys:
+                predictions: List[float]
+                upper:        List[float]
+                lower:        List[float]
+                horizon_hours: int
+                timestamps:   List[str]  (ISO format)
+        """
+        if history_df is None:
+            history_df = self._history_df
+        if history_df is None:
+            raise RuntimeError("No history loaded. Call load_history() first.")
+
+        working_df = history_df.copy()
+        last_ts = pd.to_datetime(working_df["timestamp"].iloc[-1])
+
+        predictions: List[float] = []
+        uppers: List[float] = []
+        lowers: List[float] = []
+        timestamps: List[str] = []
+
+        for step in range(n_steps):
+            next_ts = last_ts + pd.Timedelta(hours=step + 1)
+
+            featured = build_features(working_df)
+            if featured.empty:
+                pred = float(working_df[TARGET_COL].iloc[-1])
+            else:
+                X = featured[FEATURE_COLS].iloc[[-1]]
+                pred = float(self._model.predict(X)[0])
+
+            uncertainty_pct = 0.03 + 0.002 * step
+            unc = pred * uncertainty_pct
+
+            predictions.append(round(pred, 2))
+            uppers.append(round(pred + unc, 2))
+            lowers.append(round(pred - unc, 2))
+            timestamps.append(next_ts.isoformat())
+
+            # Append synthetic row to extend history for next iteration
+            new_row = working_df.iloc[-1].copy()
+            new_row["timestamp"] = next_ts
+            new_row[TARGET_COL] = pred
+            last_total = float(working_df[TARGET_COL].iloc[-1])
+            if last_total > 0:
+                ind_frac = float(working_df["industrial_mw"].iloc[-1]) / last_total
+                res_frac = float(working_df["residential_mw"].iloc[-1]) / last_total
+            else:
+                ind_frac, res_frac = 0.45, 0.55
+            new_row["industrial_mw"] = pred * ind_frac
+            new_row["residential_mw"] = pred * res_frac
+            working_df = pd.concat(
+                [working_df, pd.DataFrame([new_row])], ignore_index=True
+            )
+
+        return {
+            "predictions": predictions,
+            "upper": uppers,
+            "lower": lowers,
+            "horizon_hours": n_steps,
+            "timestamps": timestamps,
+        }
+
+    def predict_single(self, history_df: Optional[pd.DataFrame] = None) -> float:
+        """
+        Predict only the next single timestep.
+        Lightweight call for the RL environment state injection.
+        """
+        result = self.predict_next_n(n_steps=1, history_df=history_df)
+        return result["predictions"][0]

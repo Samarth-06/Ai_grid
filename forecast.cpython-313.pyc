@@ -1,0 +1,115 @@
+# backend/routers/grid.py
+"""
+GridMind — GET /grid/state  |  POST /grid/reset
+
+GET  /grid/state  → current 6-node grid state
+POST /grid/reset  → reset active scenario to "normal"
+"""
+
+import logging
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, Depends
+from pydantic import BaseModel
+
+from backend.config import Settings, get_settings
+from backend.services.scenario_engine import ScenarioEngine, get_scenario_engine
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/grid", tags=["grid"])
+
+
+# ---------------------------------------------------------------------------
+# Response schemas
+# ---------------------------------------------------------------------------
+
+class NodeState(BaseModel):
+    id: int
+    name: str
+    type: str
+    voltage_pu: float
+    load_mw: float
+    gen_mw: float
+    soc: float | None
+    alert: bool
+
+
+class LineState(BaseModel):
+    from_node: int = 0
+    to_node: int = 0
+    loading_percent: float
+    status: str
+
+    class Config:
+        # allow 'from' field even though it's a Python keyword
+        populate_by_name = True
+
+
+class GridStateResponse(BaseModel):
+    nodes: list[NodeState]
+    lines: list[dict]        # raw dicts to handle 'from' keyword
+    timestamp: str
+    demo_mode: bool
+    active_scenario: str
+    scenario_label: str
+
+
+class ResetResponse(BaseModel):
+    status: str
+    active_scenario: str
+    timestamp: str
+
+
+# ---------------------------------------------------------------------------
+# GET /grid/state
+# ---------------------------------------------------------------------------
+
+@router.get("/state", response_model=GridStateResponse)
+async def get_grid_state(
+    settings: Settings = Depends(get_settings),
+    engine: ScenarioEngine = Depends(get_scenario_engine),
+):
+    """
+    Return the current 6-node grid state.
+
+    DEMO_MODE=true  → returns synthetic scenario state from ScenarioEngine.
+    DEMO_MODE=false → returns live state from GridEnv (falls back to synthetic).
+    """
+    state = engine.get_grid_state(demo_mode=settings.demo_mode)
+    return GridStateResponse(
+        nodes=[NodeState(**n) for n in state["nodes"]],
+        lines=state["lines"],
+        timestamp=state.get("timestamp", _iso_now()),
+        demo_mode=state.get("demo_mode", settings.demo_mode),
+        active_scenario=state.get("active_scenario", "normal"),
+        scenario_label=state.get("scenario_label", "Normal Operation"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /grid/reset
+# ---------------------------------------------------------------------------
+
+@router.post("/reset", response_model=ResetResponse)
+async def reset_grid(
+    engine: ScenarioEngine = Depends(get_scenario_engine),
+):
+    """
+    Reset the grid to normal operation.
+    Resets active scenario to 'normal' and clears any injected fault.
+    """
+    engine.reset()
+    logger.info("[grid] Grid reset to normal operation.")
+    return ResetResponse(
+        status="ok",
+        active_scenario="normal",
+        timestamp=_iso_now(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Helper
+# ---------------------------------------------------------------------------
+
+def _iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat()

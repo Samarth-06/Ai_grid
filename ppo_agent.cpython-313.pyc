@@ -1,0 +1,274 @@
+"""
+GridMind — backend/models/ppo_agent.py
+PPO inference wrapper for the FastAPI backend.
+
+Usage
+-----
+from backend.models.ppo_agent import PPOAgent
+
+agent = PPOAgent()                        # auto-loads best checkpoint
+action, metadata = agent.act(obs_array)   # obs shape: (12,)
+decision_dict = agent.get_last_action_dict()
+"""
+
+import os
+import sys
+import glob
+import time
+import numpy as np
+from typing import Tuple, Dict, Any, Optional
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+ROOT           = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+CHECKPOINT_DIR = os.path.join(ROOT, "ml", "checkpoints")
+
+# Priority: best_model (saved by EvalCallback) → final → latest checkpoint
+_CANDIDATE_NAMES = ["best_model", "ppo_gridmind_final"]
+
+
+def _find_checkpoint(checkpoint_dir: str) -> Optional[str]:
+    """
+    Return the path (without .zip) of the best available checkpoint.
+    Priority: best_model > ppo_gridmind_final > latest ppo_gridmind_<step>.
+    Returns None if no checkpoint exists.
+    """
+    for name in _CANDIDATE_NAMES:
+        path = os.path.join(checkpoint_dir, name)
+        if os.path.exists(path + ".zip"):
+            return path
+
+    pattern = os.path.join(checkpoint_dir, "ppo_gridmind_*_steps.zip")
+    candidates = sorted(glob.glob(pattern))
+    if candidates:
+        # Last in sorted order = highest step count
+        return candidates[-1].replace(".zip", "")
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# PPOAgent
+# ---------------------------------------------------------------------------
+class PPOAgent:
+    """
+    Thin wrapper around a trained SB3 PPO model.
+    Falls back to a heuristic rule-based policy if no checkpoint is found.
+    """
+
+    def __init__(self, checkpoint_path: Optional[str] = None):
+        """
+        Parameters
+        ----------
+        checkpoint_path : str | None
+            Path to .zip model file (without extension).
+            If None, auto-discovers the best checkpoint in ml/checkpoints/.
+        """
+        self._model = None
+        self._last_action: Optional[np.ndarray] = None
+        self._last_obs:    Optional[np.ndarray] = None
+        self._last_reward_estimate: float = 0.0
+        self._last_metadata: Dict[str, Any]    = {}
+        self._using_fallback = False
+        self._load_time: Optional[float] = None
+
+        path = checkpoint_path or _find_checkpoint(CHECKPOINT_DIR)
+        if path is not None:
+            self._load(path)
+        else:
+            print("[PPOAgent] No checkpoint found — using rule-based fallback policy.")
+            self._using_fallback = True
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def act(self, obs: np.ndarray, deterministic: bool = True) -> Tuple[np.ndarray, Dict[str, Any]]:
+        """
+        Compute an action for the given observation.
+
+        Parameters
+        ----------
+        obs : np.ndarray of shape (12,)
+            Normalised observation vector (all values in [0, 1]).
+        deterministic : bool
+            Use deterministic policy (True for inference/demo).
+
+        Returns
+        -------
+        action : np.ndarray of shape (3,)  — clipped to action space bounds
+        metadata : dict  — info for the /agent/decision endpoint
+        """
+        obs = np.asarray(obs, dtype=np.float32).flatten()
+        if obs.shape != (12,):
+            raise ValueError(f"Expected obs shape (12,), got {obs.shape}")
+
+        self._last_obs = obs
+        t_start = time.perf_counter()
+
+        if self._model is not None:
+            action, _ = self._model.predict(obs, deterministic=deterministic)
+        else:
+            action = self._heuristic_policy(obs)
+
+        latency_ms = (time.perf_counter() - t_start) * 1000.0
+
+        action = np.clip(action.astype(np.float32),
+                         [-1.0],      # lower bound for battery_cmd is -1
+                         [ 1.0])      # upper bound for all
+        # Enforce proper bounds per dimension
+        action[0] = np.clip(action[0], 0.0, 1.0)   # route_industrial
+        action[1] = np.clip(action[1], 0.0, 1.0)   # route_residential
+        action[2] = np.clip(action[2], -1.0, 1.0)  # battery_cmd
+
+        self._last_action = action
+        self._last_metadata = self._build_metadata(obs, action, latency_ms)
+        return action, self._last_metadata
+
+    def get_last_action_dict(self) -> Dict[str, Any]:
+        """Return the metadata dict from the most recent act() call."""
+        if self._last_metadata:
+            return self._last_metadata
+        return {
+            "route_industrial":  0.5,
+            "route_residential": 0.5,
+            "battery_cmd":       0.0,
+            "battery_action_label": "idle",
+            "policy": "none",
+            "latency_ms": 0.0,
+            "obs": {},
+            "decision_summary": "No action taken yet.",
+        }
+
+    def is_loaded(self) -> bool:
+        return self._model is not None
+
+    def checkpoint_info(self) -> Dict[str, Any]:
+        return {
+            "loaded": self.is_loaded(),
+            "fallback": self._using_fallback,
+            "load_time": self._load_time,
+        }
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _load(self, path: str):
+        try:
+            from stable_baselines3 import PPO
+            print(f"[PPOAgent] Loading checkpoint: {path}.zip")
+            self._model = PPO.load(path)
+            self._load_time = time.time()
+            self._using_fallback = False
+            print("[PPOAgent] Checkpoint loaded successfully.")
+        except Exception as exc:
+            print(f"[PPOAgent] Failed to load checkpoint ({exc}) — using fallback.")
+            self._model = None
+            self._using_fallback = True
+
+    @staticmethod
+    def _heuristic_policy(obs: np.ndarray) -> np.ndarray:
+        """
+        Simple rule-based fallback policy.
+        Indexes correspond to the 12-dim observation (see PROJECT_STATE.md §13).
+        """
+        battery_soc      = float(obs[4])
+        carbon_intensity = float(obs[11])
+        industrial_norm  = float(obs[0])
+        wind_norm        = float(obs[3])
+        solar_norm       = float(obs[2])
+
+        # Default: full routing, idle battery
+        route_ind = 1.0
+        route_res = 1.0
+        batt_cmd  = 0.0
+
+        # Discharge battery when load is high and SOC is sufficient
+        if industrial_norm > 0.55 and battery_soc > 0.3:
+            batt_cmd = -0.6
+        # Charge battery when renewable surplus and SOC low
+        elif (solar_norm + wind_norm) > 0.8 and battery_soc < 0.6:
+            batt_cmd = 0.5
+        # Emergency discharge on very high load
+        elif industrial_norm > 0.75 and battery_soc > 0.15:
+            batt_cmd = -1.0
+        # Stop discharge if battery critically low
+        elif battery_soc < 0.12:
+            batt_cmd = 0.3   # gentle charge
+
+        return np.array([route_ind, route_res, batt_cmd], dtype=np.float32)
+
+    def _build_metadata(self, obs: np.ndarray, action: np.ndarray,
+                        latency_ms: float) -> Dict[str, Any]:
+        battery_cmd = float(action[2])
+        if battery_cmd < -0.1:
+            batt_label = f"discharging ({battery_cmd*100:.0f}%)"
+        elif battery_cmd > 0.1:
+            batt_label = f"charging (+{battery_cmd*100:.0f}%)"
+        else:
+            batt_label = "idle"
+
+        # Derive a simple reward estimate from obs
+        industrial_norm  = float(obs[0])
+        solar_norm       = float(obs[2])
+        wind_norm        = float(obs[3])
+        battery_soc      = float(obs[4])
+        renewable_frac   = (solar_norm * 200 + wind_norm * 200) / max(
+            (industrial_norm * 1500 + float(obs[1]) * 1500), 1.0
+        )
+        estimated_reward = (
+            1.0 * (1.0 - industrial_norm)           # stability proxy
+            - 0.5 * (1.0 - renewable_frac)          # carbon proxy
+        )
+
+        summary_parts = []
+        if battery_cmd < -0.2:
+            summary_parts.append(f"Battery discharging at {abs(battery_cmd)*100:.0f}% capacity")
+        elif battery_cmd > 0.2:
+            summary_parts.append(f"Battery charging at {battery_cmd*100:.0f}% capacity")
+        else:
+            summary_parts.append("Battery idle")
+        summary_parts.append(
+            f"Industrial routing {float(action[0])*100:.0f}%, "
+            f"Residential routing {float(action[1])*100:.0f}%"
+        )
+        if industrial_norm > 0.65:
+            summary_parts.append("High industrial load detected")
+        if battery_soc < 0.15:
+            summary_parts.append("⚠ Battery SOC critical")
+
+        return {
+            "route_industrial":     float(action[0]),
+            "route_residential":    float(action[1]),
+            "battery_cmd":          battery_cmd,
+            "battery_action_label": batt_label,
+            "policy":               "ppo" if not self._using_fallback else "heuristic",
+            "latency_ms":           round(latency_ms, 2),
+            "estimated_reward":     round(float(estimated_reward), 4),
+            "renewable_frac":       round(float(renewable_frac), 4),
+            "obs": {
+                "industrial_norm":   round(float(obs[0]), 4),
+                "residential_norm":  round(float(obs[1]), 4),
+                "solar_norm":        round(float(obs[2]), 4),
+                "wind_norm":         round(float(obs[3]), 4),
+                "battery_soc":       round(float(obs[4]), 4),
+                "carbon_intensity":  round(float(obs[11]), 4),
+            },
+            "decision_summary": ". ".join(summary_parts) + ".",
+        }
+
+
+# ---------------------------------------------------------------------------
+# Module-level singleton (lazy-loaded)
+# ---------------------------------------------------------------------------
+_agent_instance: Optional[PPOAgent] = None
+
+
+def get_agent() -> PPOAgent:
+    """Return the module-level PPOAgent singleton, loading it on first call."""
+    global _agent_instance
+    if _agent_instance is None:
+        _agent_instance = PPOAgent()
+    return _agent_instance

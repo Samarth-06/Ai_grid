@@ -1,0 +1,56 @@
+# backend/routers/carbon.py
+"""
+GridMind — GET /carbon/savings
+
+Returns cumulative CO₂ savings for the current session
+with human-readable equivalents.
+"""
+
+import logging
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, Depends
+from pydantic import BaseModel
+
+from backend.services.carbon_calc import CarbonCalculator, get_carbon_calculator
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/carbon", tags=["carbon"])
+
+
+# ---------------------------------------------------------------------------
+# Response schema
+# ---------------------------------------------------------------------------
+
+class CarbonSavingsResponse(BaseModel):
+    kg_co2_saved: float
+    kwh_optimised: float
+    trees_equivalent: float
+    car_km_equivalent: float
+    flight_hours_equivalent: float
+    annual_projection_tonnes: float
+    vs_baseline_kg: float
+    emission_factor_baseline: float
+    emission_factor_optimised: float
+    timestamp: str
+
+
+# ---------------------------------------------------------------------------
+# GET /carbon/savings
+# ---------------------------------------------------------------------------
+
+@router.get("/savings", response_model=CarbonSavingsResponse)
+async def get_carbon_savings(
+    carbon: CarbonCalculator = Depends(get_carbon_calculator),
+):
+    """
+    Return cumulative CO₂ savings for the current session.
+
+    Counters reset each time POST /scenario is called.
+    Values update in real time as the WebSocket loop runs.
+    """
+    data = carbon.savings()
+    return CarbonSavingsResponse(
+        **data,
+        timestamp=datetime.now(timezone.utc).isoformat(),
+    )

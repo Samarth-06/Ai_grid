@@ -1,0 +1,148 @@
+"""
+GridMind — backend/services/shap_cache.py
+Loads precomputed SHAP values from backend/cache/shap_values.json
+and exposes them for the /explain/{scenario_id} endpoint.
+"""
+
+import os
+import json
+from typing import Dict, Any, Optional
+
+ROOT       = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+CACHE_PATH = os.path.join(ROOT, "backend", "cache", "shap_values.json")
+
+VALID_SCENARIOS = {"industrial_spike", "storm", "battery_depletion", "dual_failure"}
+
+# ---------------------------------------------------------------------------
+# Fallback data — used when cache file is absent (e.g. before compute_shap.py runs)
+# Values match the schema in PROJECT_STATE.md §15
+# ---------------------------------------------------------------------------
+_FALLBACK: Dict[str, Any] = {
+    "industrial_spike": {
+        "scenario":    "industrial_spike",
+        "description": "Industrial load +42% demand spike",
+        "base_value":  1823.4,
+        "prediction":  2187.6,
+        "top_features": [
+            {"name": "lag_1h",        "shap_value":  142.3, "direction": "up"},
+            {"name": "hour_sin",      "shap_value":   89.1, "direction": "up"},
+            {"name": "roll_mean_12h", "shap_value":   71.2, "direction": "up"},
+            {"name": "is_weekend",    "shap_value":  -32.1, "direction": "down"},
+            {"name": "lag_24h",       "shap_value":   28.5, "direction": "up"},
+            {"name": "temp_lag1",     "shap_value":  -15.3, "direction": "down"},
+        ],
+    },
+    "storm": {
+        "scenario":    "storm",
+        "description": "Storm: solar/wind -78%, residential +15%",
+        "base_value":  1823.4,
+        "prediction":  1654.2,
+        "top_features": [
+            {"name": "solar_mw",      "shap_value": -198.7, "direction": "down"},
+            {"name": "wind_mw",       "shap_value": -143.2, "direction": "down"},
+            {"name": "lag_1h",        "shap_value":   76.4, "direction": "up"},
+            {"name": "roll_mean_3h",  "shap_value":   54.1, "direction": "up"},
+            {"name": "temp_c",        "shap_value":   31.8, "direction": "up"},
+            {"name": "hour_cos",      "shap_value":  -18.9, "direction": "down"},
+        ],
+    },
+    "battery_depletion": {
+        "scenario":    "battery_depletion",
+        "description": "Battery SOC at critical 12%, evening peak demand",
+        "base_value":  1823.4,
+        "prediction":  1998.1,
+        "top_features": [
+            {"name": "roll_mean_3h",  "shap_value":  112.6, "direction": "up"},
+            {"name": "lag_1h",        "shap_value":   95.3, "direction": "up"},
+            {"name": "hour_sin",      "shap_value":   67.8, "direction": "up"},
+            {"name": "lag_24h",       "shap_value":   43.2, "direction": "up"},
+            {"name": "carbon_intensity", "shap_value": -24.5, "direction": "down"},
+            {"name": "roll_std_3h",   "shap_value":   19.7, "direction": "up"},
+        ],
+    },
+    "dual_failure": {
+        "scenario":    "dual_failure",
+        "description": "Wind offline + industrial spike simultaneously",
+        "base_value":  1823.4,
+        "prediction":  2341.8,
+        "top_features": [
+            {"name": "lag_1h",        "shap_value":  187.4, "direction": "up"},
+            {"name": "wind_mw",       "shap_value": -143.2, "direction": "down"},
+            {"name": "roll_mean_12h", "shap_value":  121.6, "direction": "up"},
+            {"name": "hour_sin",      "shap_value":   88.3, "direction": "up"},
+            {"name": "industrial_mw", "shap_value":   76.1, "direction": "up"},
+            {"name": "roll_std_3h",   "shap_value":   31.4, "direction": "up"},
+        ],
+    },
+}
+
+
+class SHAPCache:
+    """
+    Loads shap_values.json once at startup and serves it by scenario_id.
+    Falls back to hard-coded values if the file is missing.
+    """
+
+    def __init__(self, cache_path: str = CACHE_PATH):
+        self._cache_path = cache_path
+        self._data: Dict[str, Any] = {}
+        self._from_file = False
+        self._load()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def get(self, scenario_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Return SHAP data for a scenario, or None if not found.
+        scenario_id: 'industrial_spike' | 'storm' | 'battery_depletion' | 'dual_failure'
+        """
+        if scenario_id not in VALID_SCENARIOS:
+            raise ValueError(
+                f"Unknown scenario_id '{scenario_id}'. "
+                f"Valid: {sorted(VALID_SCENARIOS)}"
+            )
+        return self._data.get(scenario_id)
+
+    def get_all(self) -> Dict[str, Any]:
+        return dict(self._data)
+
+    def is_from_file(self) -> bool:
+        return self._from_file
+
+    def reload(self):
+        """Re-read the cache file from disk (call after running compute_shap.py)."""
+        self._load()
+
+    # ------------------------------------------------------------------
+    # Private
+    # ------------------------------------------------------------------
+
+    def _load(self):
+        if os.path.exists(self._cache_path):
+            try:
+                with open(self._cache_path, "r", encoding="utf-8") as f:
+                    self._data = json.load(f)
+                self._from_file = True
+                print(f"[SHAPCache] Loaded {len(self._data)} scenarios from {self._cache_path}")
+                return
+            except Exception as exc:
+                print(f"[SHAPCache] Failed to load cache file ({exc}) — using fallback.")
+
+        self._data = dict(_FALLBACK)
+        self._from_file = False
+        print("[SHAPCache] Using built-in fallback SHAP values.")
+
+
+# ---------------------------------------------------------------------------
+# Module-level singleton
+# ---------------------------------------------------------------------------
+_shap_cache_instance: Optional[SHAPCache] = None
+
+
+def get_shap_cache() -> SHAPCache:
+    global _shap_cache_instance
+    if _shap_cache_instance is None:
+        _shap_cache_instance = SHAPCache()
+    return _shap_cache_instance

@@ -1,0 +1,333 @@
+# backend/services/scenario_engine.py
+"""
+GridMind — Scenario state machine.
+
+Manages the active demo scenario, injects it into GridEnv,
+and provides cached grid/decision state for DEMO_MODE.
+
+Scenarios
+---------
+  normal              — baseline grid operation
+  industrial_spike    — industrial load +42%
+  storm               — solar/wind -78%, residential +15%
+  battery_depletion   — battery SOC at critical 12%
+  dual_failure        — wind offline + industrial spike
+
+State machine transitions
+-------------------------
+  Any scenario → normal  (via reset)
+  normal → any scenario  (via inject)
+  active scenario → any scenario (override allowed)
+"""
+
+import json
+import os
+import threading
+import time
+from typing import Any, Dict, List, Optional
+
+# ---------------------------------------------------------------------------
+# Scenario presets — mirror grid_env.py SCENARIO_PRESETS exactly
+# ---------------------------------------------------------------------------
+
+VALID_SCENARIOS = {
+    "normal",
+    "industrial_spike",
+    "storm",
+    "battery_depletion",
+    "dual_failure",
+}
+
+SCENARIO_LABELS = {
+    "normal":             "Normal Operation",
+    "industrial_spike":   "Industrial Demand Spike (+42%)",
+    "storm":              "Storm Event (Solar/Wind -78%)",
+    "battery_depletion":  "Battery Depletion (SOC 12%)",
+    "dual_failure":       "Dual Failure (Wind Offline + Spike)",
+}
+
+# ---------------------------------------------------------------------------
+# Synthetic demo grid state — used when DEMO_MODE=true or env unavailable
+# ---------------------------------------------------------------------------
+
+def _make_demo_state(scenario_id: str, tick: int = 0) -> Dict:
+    """
+    Returns a plausible grid state dict for a given scenario.
+    Values are static per scenario; tick drives minor animation variation.
+    """
+    base_states = {
+        "normal": {
+            # Power balance: Sub(1055) + Solar(165) + Wind(120) + Bat(0) = 1340 MW = Industrial(580) + Residential(760)
+            "nodes": [
+                {"id": 0, "name": "Substation",  "type": "slack",     "voltage_pu": 1.00, "load_mw": 0.0,   "gen_mw": 1055.0, "soc": None,  "alert": False},
+                {"id": 1, "name": "Industrial",  "type": "load",      "voltage_pu": 0.98, "load_mw": 580.0, "gen_mw": 0.0,    "soc": None,  "alert": False},
+                {"id": 2, "name": "Residential", "type": "load",      "voltage_pu": 0.97, "load_mw": 760.0, "gen_mw": 0.0,    "soc": None,  "alert": False},
+                {"id": 3, "name": "Solar",       "type": "generator", "voltage_pu": 1.01, "load_mw": 0.0,   "gen_mw": 165.0,  "soc": None,  "alert": False},
+                {"id": 4, "name": "Wind",        "type": "generator", "voltage_pu": 1.00, "load_mw": 0.0,   "gen_mw": 120.0,  "soc": None,  "alert": False},
+                {"id": 5, "name": "Battery",     "type": "storage",   "voltage_pu": 0.99, "load_mw": 0.0,   "gen_mw": 0.0,    "soc": 0.72,  "alert": False},
+            ],
+            "lines": [
+                {"from": 0, "to": 1, "loading_percent": 58.0,  "status": "ok"},
+                {"from": 0, "to": 2, "loading_percent": 69.0,  "status": "ok"},
+                {"from": 3, "to": 0, "loading_percent": 34.0,  "status": "ok"},
+                {"from": 4, "to": 0, "loading_percent": 28.0,  "status": "ok"},
+                {"from": 5, "to": 0, "loading_percent": 12.0,  "status": "ok"},
+            ],
+        },
+        "industrial_spike": {
+            "nodes": [
+                {"id": 0, "name": "Substation",  "type": "slack",     "voltage_pu": 0.96, "load_mw": 0.0,    "gen_mw": 1240.0, "soc": None,  "alert": True},
+                {"id": 1, "name": "Industrial",  "type": "load",      "voltage_pu": 0.93, "load_mw": 823.0,  "gen_mw": 0.0,    "soc": None,  "alert": True},
+                {"id": 2, "name": "Residential", "type": "load",      "voltage_pu": 0.97, "load_mw": 760.0,  "gen_mw": 0.0,    "soc": None,  "alert": False},
+                {"id": 3, "name": "Solar",       "type": "generator", "voltage_pu": 1.01, "load_mw": 0.0,    "gen_mw": 165.0,  "soc": None,  "alert": False},
+                {"id": 4, "name": "Wind",        "type": "generator", "voltage_pu": 1.00, "load_mw": 0.0,    "gen_mw": 120.0,  "soc": None,  "alert": False},
+                {"id": 5, "name": "Battery",     "type": "storage",   "voltage_pu": 0.99, "load_mw": 0.0,    "gen_mw": 85.0,   "soc": 0.58,  "alert": False},
+            ],
+            "lines": [
+                {"from": 0, "to": 1, "loading_percent": 91.0,  "status": "warning"},
+                {"from": 0, "to": 2, "loading_percent": 62.0,  "status": "ok"},
+                {"from": 3, "to": 0, "loading_percent": 34.0,  "status": "ok"},
+                {"from": 4, "to": 0, "loading_percent": 28.0,  "status": "ok"},
+                {"from": 5, "to": 0, "loading_percent": 48.0,  "status": "ok"},
+            ],
+        },
+        "storm": {
+            # Power balance: Sub(1294) + Solar(34) + Wind(26) + Bat(100) = 1454 MW = Industrial(580) + Residential(874)
+            "nodes": [
+                {"id": 0, "name": "Substation",  "type": "slack",     "voltage_pu": 0.95, "load_mw": 0.0,    "gen_mw": 1294.0, "soc": None,  "alert": True},
+                {"id": 1, "name": "Industrial",  "type": "load",      "voltage_pu": 0.94, "load_mw": 580.0,  "gen_mw": 0.0,    "soc": None,  "alert": False},
+                {"id": 2, "name": "Residential", "type": "load",      "voltage_pu": 0.93, "load_mw": 874.0,  "gen_mw": 0.0,    "soc": None,  "alert": True},
+                {"id": 3, "name": "Solar",       "type": "generator", "voltage_pu": 0.98, "load_mw": 0.0,    "gen_mw": 34.0,   "soc": None,  "alert": True},
+                {"id": 4, "name": "Wind",        "type": "generator", "voltage_pu": 0.97, "load_mw": 0.0,    "gen_mw": 26.0,   "soc": None,  "alert": True},
+                {"id": 5, "name": "Battery",     "type": "storage",   "voltage_pu": 0.99, "load_mw": 0.0,    "gen_mw": 100.0,  "soc": 0.41,  "alert": False},
+            ],
+            "lines": [
+                {"from": 0, "to": 1, "loading_percent": 74.0,  "status": "ok"},
+                {"from": 0, "to": 2, "loading_percent": 88.0,  "status": "warning"},
+                {"from": 3, "to": 0, "loading_percent": 8.0,   "status": "ok"},
+                {"from": 4, "to": 0, "loading_percent": 7.0,   "status": "ok"},
+                {"from": 5, "to": 0, "loading_percent": 55.0,  "status": "ok"},
+            ],
+        },
+        "battery_depletion": {
+            # Power balance: Sub(1338) + Solar(20) + Wind(110) + Bat(12) = 1480 MW = Industrial(600) + Residential(880)
+            "nodes": [
+                {"id": 0, "name": "Substation",  "type": "slack",     "voltage_pu": 0.96, "load_mw": 0.0,    "gen_mw": 1338.0, "soc": None,  "alert": True},
+                {"id": 1, "name": "Industrial",  "type": "load",      "voltage_pu": 0.95, "load_mw": 600.0,  "gen_mw": 0.0,    "soc": None,  "alert": False},
+                {"id": 2, "name": "Residential", "type": "load",      "voltage_pu": 0.94, "load_mw": 880.0,  "gen_mw": 0.0,    "soc": None,  "alert": True},
+                {"id": 3, "name": "Solar",       "type": "generator", "voltage_pu": 0.98, "load_mw": 0.0,    "gen_mw": 20.0,   "soc": None,  "alert": False},
+                {"id": 4, "name": "Wind",        "type": "generator", "voltage_pu": 1.00, "load_mw": 0.0,    "gen_mw": 110.0,  "soc": None,  "alert": False},
+                {"id": 5, "name": "Battery",     "type": "storage",   "voltage_pu": 0.97, "load_mw": 0.0,    "gen_mw": 12.0,   "soc": 0.12,  "alert": True},
+            ],
+            "lines": [
+                {"from": 0, "to": 1, "loading_percent": 78.0,  "status": "ok"},
+                {"from": 0, "to": 2, "loading_percent": 92.0,  "status": "warning"},
+                {"from": 3, "to": 0, "loading_percent": 5.0,   "status": "ok"},
+                {"from": 4, "to": 0, "loading_percent": 32.0,  "status": "ok"},
+                {"from": 5, "to": 0, "loading_percent": 6.0,   "status": "ok"},
+            ],
+        },
+        "dual_failure": {
+            "nodes": [
+                {"id": 0, "name": "Substation",  "type": "slack",     "voltage_pu": 0.91, "load_mw": 0.0,    "gen_mw": 1380.0, "soc": None,  "alert": True},
+                {"id": 1, "name": "Industrial",  "type": "load",      "voltage_pu": 0.89, "load_mw": 823.0,  "gen_mw": 0.0,    "soc": None,  "alert": True},
+                {"id": 2, "name": "Residential", "type": "load",      "voltage_pu": 0.90, "load_mw": 760.0,  "gen_mw": 0.0,    "soc": None,  "alert": True},
+                {"id": 3, "name": "Solar",       "type": "generator", "voltage_pu": 1.01, "load_mw": 0.0,    "gen_mw": 165.0,  "soc": None,  "alert": False},
+                {"id": 4, "name": "Wind",        "type": "generator", "voltage_pu": 0.85, "load_mw": 0.0,    "gen_mw": 0.0,    "soc": None,  "alert": True},
+                {"id": 5, "name": "Battery",     "type": "storage",   "voltage_pu": 0.96, "load_mw": 0.0,    "gen_mw": 100.0,  "soc": 0.34,  "alert": True},
+            ],
+            "lines": [
+                {"from": 0, "to": 1, "loading_percent": 98.0,  "status": "critical"},
+                {"from": 0, "to": 2, "loading_percent": 87.0,  "status": "warning"},
+                {"from": 3, "to": 0, "loading_percent": 34.0,  "status": "ok"},
+                {"from": 4, "to": 0, "loading_percent": 0.0,   "status": "critical"},
+                {"from": 5, "to": 0, "loading_percent": 55.0,  "status": "ok"},
+            ],
+        },
+    }
+
+    state = base_states.get(scenario_id, base_states["normal"])
+    return state
+
+
+def _make_demo_decision(scenario_id: str) -> Dict:
+    """Canned PPO decision for each scenario."""
+    decisions = {
+        "normal": {
+            "action": {"route_industrial": 0.50, "route_residential": 0.50, "battery_cmd": 0.05},
+            "reward": 0.91,
+            "stability_score": 0.94,
+            "carbon_reduction": 0.18,
+            "brownout_risk": 0.02,
+            "rationale": "Grid balanced. Minor battery top-up.",
+        },
+        "industrial_spike": {
+            "action": {"route_industrial": 0.78, "route_residential": 0.45, "battery_cmd": -0.85},
+            "reward": 0.74,
+            "stability_score": 0.71,
+            "carbon_reduction": 0.22,
+            "brownout_risk": 0.18,
+            "rationale": "Industrial spike detected. Rerouting load + discharging battery to prevent brownout.",
+        },
+        "storm": {
+            "action": {"route_industrial": 0.42, "route_residential": 0.62, "battery_cmd": -0.92},
+            "reward": 0.68,
+            "stability_score": 0.66,
+            "carbon_reduction": 0.09,
+            "brownout_risk": 0.24,
+            "rationale": "Renewable generation collapsed. Battery discharge prioritised. Substation load elevated.",
+        },
+        "battery_depletion": {
+            "action": {"route_industrial": 0.38, "route_residential": 0.55, "battery_cmd": 0.15},
+            "reward": 0.61,
+            "stability_score": 0.63,
+            "carbon_reduction": 0.14,
+            "brownout_risk": 0.31,
+            "rationale": "Battery critically low. Conserving remaining SOC. Load shedding risk if demand rises.",
+        },
+        "dual_failure": {
+            "action": {"route_industrial": 0.88, "route_residential": 0.71, "battery_cmd": -1.0},
+            "reward": 0.44,
+            "stability_score": 0.42,
+            "carbon_reduction": 0.06,
+            "brownout_risk": 0.48,
+            "rationale": "CRITICAL: Wind offline + industrial spike. Full battery discharge. Emergency rerouting active.",
+        },
+    }
+    return decisions.get(scenario_id, decisions["normal"])
+
+
+# ---------------------------------------------------------------------------
+# Scenario Engine
+# ---------------------------------------------------------------------------
+
+class ScenarioEngine:
+    """
+    Thread-safe state machine for managing the active demo scenario.
+
+    In DEMO_MODE the engine serves synthetic grid/decision state.
+    In live mode it injects into a GridEnv instance.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._active_scenario: str = "normal"
+        self._language: str = "en"
+        self._tick: int = 0
+        self._injected_at: float = time.time()
+        self._grid_env = None          # set by main.py lifespan
+
+    # ------------------------------------------------------------------
+    # Wiring
+    # ------------------------------------------------------------------
+
+    def attach_env(self, grid_env) -> None:
+        """Attach a live GridEnv for non-DEMO_MODE operation."""
+        with self._lock:
+            self._grid_env = grid_env
+
+    # ------------------------------------------------------------------
+    # State transitions
+    # ------------------------------------------------------------------
+
+    def inject(self, scenario_id: str, language: str = "en") -> Dict:
+        """
+        Activate a scenario. Returns the resulting grid state.
+
+        Args:
+            scenario_id: One of VALID_SCENARIOS.
+            language: "en" | "kz" | "ru"
+
+        Raises:
+            ValueError: If scenario_id is not in VALID_SCENARIOS.
+        """
+        if scenario_id not in VALID_SCENARIOS:
+            raise ValueError(
+                f"Unknown scenario '{scenario_id}'. "
+                f"Valid: {sorted(VALID_SCENARIOS)}"
+            )
+
+        with self._lock:
+            self._active_scenario = scenario_id
+            self._language = language
+            self._tick = 0
+            self._injected_at = time.time()
+
+            if self._grid_env is not None:
+                try:
+                    self._grid_env.inject_scenario(scenario_id)
+                except Exception:
+                    pass  # fall through to demo state
+
+        return self.get_grid_state()
+
+    def reset(self) -> Dict:
+        """Reset to normal operation."""
+        return self.inject("normal", self._language)
+
+    # ------------------------------------------------------------------
+    # Reads
+    # ------------------------------------------------------------------
+
+    def tick(self) -> None:
+        """Advance internal tick counter (called by WebSocket broadcaster)."""
+        with self._lock:
+            self._tick += 1
+
+    def get_active_scenario(self) -> str:
+        with self._lock:
+            return self._active_scenario
+
+    def get_language(self) -> str:
+        with self._lock:
+            return self._language
+
+    def get_grid_state(self, demo_mode: bool = True) -> Dict:
+        """
+        Return current grid state dict.
+        Always returns demo state (live env integration is via WebSocket).
+        """
+        with self._lock:
+            scenario = self._active_scenario
+            tick = self._tick
+
+        state = _make_demo_state(scenario, tick)
+        state["timestamp"] = _iso_now()
+        state["demo_mode"] = demo_mode
+        state["active_scenario"] = scenario
+        state["scenario_label"] = SCENARIO_LABELS.get(scenario, scenario)
+        return state
+
+    def get_decision(self) -> Dict:
+        """Return the current PPO decision for the active scenario."""
+        with self._lock:
+            scenario = self._active_scenario
+        decision = _make_demo_decision(scenario)
+        decision["scenario_id"] = scenario
+        decision["timestamp"] = _iso_now()
+        return decision
+
+    def elapsed_seconds(self) -> float:
+        with self._lock:
+            return time.time() - self._injected_at
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _iso_now() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Module-level singleton
+# ---------------------------------------------------------------------------
+
+_engine: ScenarioEngine = ScenarioEngine()
+
+
+def get_scenario_engine() -> ScenarioEngine:
+    """FastAPI dependency — returns the process-wide singleton."""
+    return _engine

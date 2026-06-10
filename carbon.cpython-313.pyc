@@ -1,0 +1,132 @@
+# backend/routers/explain.py
+"""
+GridMind — GET /explain/{scenario_id}
+
+Returns SHAP feature attributions + LLM natural-language explanation
+for the requested scenario in English, Kazakh, or Russian.
+
+Cache hierarchy (checked in order, first hit wins):
+  1. In-memory dict
+  2. backend/cache/explanations.json
+  3. NVIDIA NIM live call
+  4. Template fallback (never fails)
+
+Bug fix: LLMExplainService and get_llm_explain() do not exist in
+llm_explain.py. The module exposes generate_explanation() as a
+top-level async function. Call it directly instead of via a class.
+"""
+
+import logging
+from typing import Literal
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+
+from backend.config import Settings, get_settings
+from backend.services.scenario_engine import VALID_SCENARIOS
+from backend.services.shap_cache import SHAPCache, get_shap_cache
+import backend.services.llm_explain as llm_explain
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/explain", tags=["explain"])
+
+
+# ---------------------------------------------------------------------------
+# Response schema
+# ---------------------------------------------------------------------------
+
+class TopFeature(BaseModel):
+    name: str
+    shap_value: float
+    direction: str          # "up" | "down"
+
+
+class ExplainResponse(BaseModel):
+    scenario_id: str
+    language: str
+    base_value: float
+    prediction: float
+    top_features: list[TopFeature]
+    explanation: str         # LLM-generated narrative
+    explanation_source: str  # "cache_memory" | "cache_file" | "nim_live" | "template"
+    demo_mode: bool
+
+
+# ---------------------------------------------------------------------------
+# GET /explain/{scenario_id}
+# ---------------------------------------------------------------------------
+
+@router.get("/{scenario_id}", response_model=ExplainResponse)
+async def get_explanation(
+    scenario_id: str,
+    lang: Literal["en", "kz", "ru"] = "en",
+    settings: Settings = Depends(get_settings),
+    shap_cache: SHAPCache = Depends(get_shap_cache),
+):
+    """
+    Return SHAP waterfall data + LLM narrative for a scenario.
+
+    Query params:
+        lang: "en" | "kz" | "ru"  (default "en")
+    """
+    if scenario_id not in VALID_SCENARIOS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown scenario '{scenario_id}'. Valid: {sorted(VALID_SCENARIOS)}",
+        )
+
+    # 1. SHAP values
+    shap_data = shap_cache.get(scenario_id)
+    if shap_data is None:
+        raise HTTPException(
+            status_code=503,
+            detail=f"SHAP cache not available for '{scenario_id}'. Run ml/compute_shap.py.",
+        )
+
+    top_features_raw = shap_data.get("top_features", [])
+
+    # 2. LLM explanation — call module-level async function directly.
+    # generate_explanation() is cache-first and never raises; it falls
+    # back to a deterministic template if all network calls fail.
+    try:
+        explanation = await llm_explain.generate_explanation(
+            scenario_id=scenario_id,
+            language=lang,
+            shap_top_features=top_features_raw,
+        )
+        explanation_source = _resolve_source(scenario_id, lang)
+    except Exception as exc:
+        logger.warning("[explain] generate_explanation failed (%s) — using template.", exc)
+        explanation = llm_explain._build_fallback(scenario_id, lang)
+        explanation_source = "template"
+
+    top_features = [TopFeature(**f) for f in top_features_raw]
+
+    return ExplainResponse(
+        scenario_id=scenario_id,
+        language=lang,
+        base_value=shap_data.get("base_value", 0.0),
+        prediction=shap_data.get("prediction", 0.0),
+        top_features=top_features,
+        explanation=explanation,
+        explanation_source=explanation_source,
+        demo_mode=settings.demo_mode,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Helper — infer where the explanation came from for observability
+# ---------------------------------------------------------------------------
+
+def _resolve_source(scenario_id: str, lang: str) -> str:
+    """
+    Inspect the module-level caches to label the explanation source.
+    Order matches generate_explanation() cache hierarchy.
+    """
+    cache_key = (scenario_id, lang)
+    if cache_key in llm_explain._MEM_CACHE:
+        file_hit = llm_explain._FILE_CACHE.get(scenario_id, {}).get(lang)
+        if file_hit and llm_explain._MEM_CACHE[cache_key] == file_hit:
+            return "cache_file"
+        return "cache_memory"
+    return "template"
